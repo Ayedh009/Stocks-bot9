@@ -1,7 +1,7 @@
 name: stocks-bot
 on:
   schedule:
-    - cron: "*/5 13-21 * * 1-5"
+    - cron: "*/5 12-21 * * 1-5"   # UTC: يغطي 8:00 ص – 4:15 م نيويورك صيفاً وشتاءً
   workflow_dispatch:
 
 concurrency:
@@ -12,43 +12,22 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: gate
-        id: gate
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "go=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          export TZ=America/New_York
-          H=$(date +%H); M=$(date +%M); D=$(date +%u)
-          NOW=$((10#$H*60+10#$M))
-          if [ $D -le 5 ] && [ $NOW -ge 570 ] && [ $NOW -le 960 ]; then
-            echo "go=true" >> $GITHUB_OUTPUT
-          else
-            echo "go=false" >> $GITHUB_OUTPUT
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.gate.outputs.go == 'true'
 
       - uses: actions/setup-python@v5
-        if: steps.gate.outputs.go == 'true'
         with:
           python-version: "3.12"
           cache: pip
 
       - run: pip install -r requirements.txt
-        if: steps.gate.outputs.go == 'true'
 
       - uses: actions/cache@v4
-        if: steps.gate.outputs.go == 'true'
         with:
           path: state.json
           key: state-${{ github.run_id }}
           restore-keys: state-
 
       - run: python bot_once.py
-        if: steps.gate.outputs.go == 'true'
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
