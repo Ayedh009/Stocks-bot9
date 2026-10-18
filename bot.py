@@ -30,6 +30,7 @@ def load_state():
     s.setdefault("offset", 0)
     s.setdefault("life", {})
     s.setdefault("near", {})
+    s.setdefault("h4", {})
     s.setdefault("summaries", {})
     if s.get("ver") != VERSION:           # تحديث قائمة الشركات مرة واحدة
         s["symbols"] = list(DEFAULT_SYMBOLS)
@@ -59,8 +60,8 @@ def scan_window_open():
 
 
 def status_board(s, title):
-    """لوحة حالة كل الأسهم: الاتجاه ومستوى الكسر والمرحلة."""
-    lines = [title]
+    """لوحة حالة: الصفقات النشطة أولاً، والمنتهية مختصرة في سطر."""
+    active, done = [], []
     for sym in s["symbols"]:
         try:
             d1, d4 = load(sym)
@@ -68,16 +69,24 @@ def status_board(s, title):
             price = float(d1["Close"].iloc[-1])
             m1 = last_mss(r1)
             if not m1:
-                lines.append(f"• {sym} {price:.2f} — لا يوجد كسر")
+                done.append(sym)
                 continue
             lc = lifecycle(r1, r4, m1)
+            if lc["stage"] in TERMINAL:
+                done.append(sym)
+                continue
             arrow = "🟢" if m1["dir"] == "bull" else "🔴"
             conf = " ✅4س" if lc["confirmed"] else ""
             warn = " ⚠️" if lc["warn"] else ""
-            lines.append(f"• {sym} {price:.2f} {arrow} كسر {m1['level']:.2f}{conf}"
-                         f" — {STAGE_TXT[lc['stage']]}{warn}")
+            active.append(f"• {sym} {price:.2f} {arrow} كسر {m1['level']:.2f}{conf}"
+                          f" — {STAGE_TXT[lc['stage']]}{warn}")
         except Exception as e:
-            lines.append(f"• {sym} — خطأ {e}")
+            active.append(f"• {sym} — خطأ {e}")
+    lines = [title, ""]
+    lines.append("🟢 صفقات نشطة:" if active else "لا توجد صفقات نشطة الآن.")
+    lines += active
+    if done:
+        lines += ["", "⚪ بدون صفقة نشطة: " + ", ".join(done)]
     return "\n".join(lines)
 
 
@@ -178,14 +187,27 @@ def near_text(sym, price, near, ts):
     return "\n".join(lines)
 
 
+def h4_text(sym, price, m4, m1, r4):
+    arrow = "🟢 صاعد" if m4["dir"] == "bull" else "🔴 هابط"
+    t = r4["df"].index[m4["i"]].strftime("%m-%d %H:%M")
+    lines = [f"🔷 كسر هيكل 4 ساعات (MSS) | {sym} {arrow}",
+             f"مستوى الكسر: {m4['level']:.2f} | السعر {price:.2f}",
+             f"شمعة الكسر: {t} نيويورك"]
+    if m1 and m1["dir"] == m4["dir"]:
+        lines.append("✅ يؤكد كسر الساعة الحالي")
+    elif m1:
+        lines.append("⚠️ عكس اتجاه كسر الساعة الحالي")
+    else:
+        lines.append("لا يوجد كسر ساعة حالياً")
+    return "\n".join(lines)
+
+
 def short_text(sym, price, m1, lc, old):
     """رسالة قصيرة عند تغيّر المرحلة فقط."""
     arrow = "🟢 صاعد" if m1["dir"] == "bull" else "🔴 هابط"
     lines = []
     if lc["stage"] != old["stage"]:
         lines.append(f"{STAGE_TXT[lc['stage']]} | {sym} {arrow}")
-    if lc["confirmed"] and not old["conf"]:
-        lines.append(f"✅ تأكد على 4س | {sym} {arrow}")
     if lc["warn"] and not old["warn"]:
         lines.append(f"⚠️ {sym}: كسر وقف 1 ({lc['stop1']:.2f}) — الإلغاء عند وقف 2 ({lc['stop2']:.2f})")
     lines.append(f"السعر {price:.2f} | كسر {m1['level']:.2f}")
@@ -201,28 +223,37 @@ def process(sym, s):
     ts = d1.index[-1].strftime("%H:%M")
     cid = s["chat_id"]
 
-    # 1) دورة الصفقة (رسالة فقط عند تغيّر المرحلة)
+    # 1) دورة الصفقة (المحرك: كسر الساعة)
     m1 = last_mss(r1)
     if m1:
         lc = lifecycle(r1, r4, m1)
         trade = f"{m1['dir']}|{round(m1['level'], 2)}"
-        cur = dict(trade=trade, stage=lc["stage"], warn=lc["warn"],
-                   conf=lc["confirmed"])
+        cur = dict(trade=trade, stage=lc["stage"], warn=lc["warn"])
         old = s["life"].get(sym)
-        if old != cur:
-            if old is None and lc["stage"] in TERMINAL:
-                pass                       # صفقة قديمة منتهية: نسجلها بصمت
-            elif old is None or old["trade"] != trade:
-                prefix = ""
-                if (old and old["stage"] not in TERMINAL
-                        and old["trade"].split("|")[0] != m1["dir"]):
-                    prefix = "❌ انتهت الصفقة السابقة (MSS معاكس على الساعة)\n\n"
-                send(cid, prefix + "🔔 " + report(sym, (d1, d4, r1, r4)))
-            else:
-                send(cid, short_text(sym, price, m1, lc, old))
-            s["life"][sym] = cur
+        if old is None and lc["stage"] in TERMINAL:
+            pass                           # صفقة قديمة منتهية: نسجلها بصمت
+        elif old is None or old["trade"] != trade:
+            prefix = ""
+            if (old and old["stage"] not in TERMINAL
+                    and old["trade"].split("|")[0] != m1["dir"]):
+                prefix = "❌ انتهت الصفقة السابقة (MSS معاكس على الساعة)\n\n"
+            send(cid, prefix + "🔔 " + report(sym, (d1, d4, r1, r4)))
+        elif old["stage"] != cur["stage"] or old["warn"] != cur["warn"]:
+            send(cid, short_text(sym, price, m1, lc, old))
+        s["life"][sym] = cur
 
-    # 2) تنبيه الاقتراب
+    # 2) تنبيه مستقل: كسر هيكل 4 ساعات
+    m4 = last_mss(r4)
+    if m4:
+        k4 = f"{m4['dir']}|{round(m4['level'], 2)}"
+        old4 = s["h4"].get(sym)
+        if k4 != old4:
+            recent = m4["i"] >= len(r4["df"]) - 2   # حدث في آخر شمعتين
+            if old4 is not None or recent:
+                send(cid, h4_text(sym, price, m4, m1, r4))
+            s["h4"][sym] = k4
+
+    # 3) تنبيه الاقتراب
     near = near_info(r1, r4, price)
     new = False
     for tf in ("1H", "4H"):
