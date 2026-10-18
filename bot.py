@@ -3,7 +3,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from scanner import (load, analyze, last_mss, report, near_info, NEAR_USD)
 
-TOKEN = os.getenv("BOT_TOKEN", "ضع_التوكن_هنا")
+TOKEN = os.getenv("BOT_TOKEN", "8903554903:AAEIYKzWbc1P0QxLcHrXwBTET7w_z25zOaY")
 API = f"https://api.telegram.org/bot{TOKEN}"
 STATE = "state.json"
 INTERVAL = 15 * 60
