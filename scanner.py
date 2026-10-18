@@ -27,9 +27,10 @@ def load(symbol):
                      auto_adjust=True, progress=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    df = df[["Open", "High", "Low", "Close"]].dropna()
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
     h4 = df.resample("4h", offset="9h30min").agg(
-        {"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
+        {"Open": "first", "High": "max", "Low": "min", "Close": "last",
+         "Volume": "sum"}).dropna()
     return df, h4
 
 
