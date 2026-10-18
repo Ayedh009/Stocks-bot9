@@ -1,9 +1,10 @@
 import os, json, time, requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from scanner import (load, analyze, last_mss, report, near_info, NEAR_USD)
+from scanner import (load, analyze, last_mss, report, near_info, lifecycle,
+                     NEAR_USD, STAGE_TXT, TERMINAL)
 
-TOKEN = os.environ["BOT_TOKEN"]          # التوكن من المتغيرات السرية فقط
+TOKEN = os.environ["BOT_TOKEN"]          # يُقرأ من المتغيرات السرية، لا يُكتب هنا
 API = f"https://api.telegram.org/bot{TOKEN}"
 STATE = "state.json"
 INTERVAL = 5 * 60                        # فحص كل 5 دقائق
@@ -13,7 +14,7 @@ NY = ZoneInfo("America/New_York")
 SCAN_START = 8 * 60 + 30                 # 8:30 صباحاً نيويورك
 SCAN_END = 16 * 60                       # 4:00 عصراً نيويورك
 SUMMARIES = {"am": 8 * 60, "pm": 16 * 60 + 15}   # 8:00 و 4:15
-SUMMARY_GRACE = 30                       # دقائق سماح لإرسال الملخص
+SUMMARY_GRACE = 30
 DEFAULT_SYMBOLS = [
     "TSLA", "META", "AMD", "NVDA", "MU", "AAPL", "MSFT",
     "SNDK", "QQQ", "CRCL", "COIN", "CRWV", "QCOM", "AMZN", "BA",
@@ -26,7 +27,7 @@ def load_state():
     s = json.load(open(STATE)) if os.path.exists(STATE) else {}
     s.setdefault("chat_id", None)
     s.setdefault("offset", 0)
-    s.setdefault("sent", {})
+    s.setdefault("life", {})
     s.setdefault("near", {})
     s.setdefault("summaries", {})
     if s.get("ver") != VERSION:           # تحديث قائمة الشركات مرة واحدة
@@ -57,22 +58,23 @@ def scan_window_open():
 
 
 def status_board(s, title):
-    """لوحة حالة كل الأسهم: آخر كسر MSS على الساعة والاتجاه ومستواه."""
+    """لوحة حالة كل الأسهم: الاتجاه ومستوى الكسر والمرحلة."""
     lines = [title]
     for sym in s["symbols"]:
         try:
             d1, d4 = load(sym)
             r1, r4 = analyze(d1), analyze(d4)
             price = float(d1["Close"].iloc[-1])
-            m1, m4 = last_mss(r1), last_mss(r4)
+            m1 = last_mss(r1)
             if not m1:
-                lines.append(f"• {sym} {price:.2f} — لا يوجد كسر نشط")
+                lines.append(f"• {sym} {price:.2f} — لا يوجد كسر")
                 continue
-            arrow = "🟢 صاعد" if m1["dir"] == "bull" else "🔴 هابط"
-            conf = " ✅ مؤكد 4س" if (m4 and m4["dir"] == m1["dir"]) else ""
-            retest = " | إعادة اختبار ✔" if m1["retest"] else ""
-            lines.append(f"• {sym} {price:.2f} — {arrow} عند "
-                         f"{m1['level']:.2f}{conf}{retest}")
+            lc = lifecycle(r1, r4, m1)
+            arrow = "🟢" if m1["dir"] == "bull" else "🔴"
+            conf = " ✅4س" if lc["confirmed"] else ""
+            warn = " ⚠️" if lc["warn"] else ""
+            lines.append(f"• {sym} {price:.2f} {arrow} كسر {m1['level']:.2f}{conf}"
+                         f" — {STAGE_TXT[lc['stage']]}{warn}")
         except Exception as e:
             lines.append(f"• {sym} — خطأ {e}")
     return "\n".join(lines)
@@ -91,7 +93,6 @@ def due_summaries(s):
                          else "🌇 ملخص نهاية اليوم")
                 send(s["chat_id"], status_board(s, title))
             s["summaries"][key] = True
-    # تنظيف القديم
     s["summaries"] = {k: v for k, v in s["summaries"].items()
                       if k.startswith(day)}
     save_state(s)
@@ -165,6 +166,22 @@ def near_text(sym, price, near, ts):
     return "\n".join(lines)
 
 
+def short_text(sym, price, m1, lc, old):
+    """رسالة قصيرة عند تغيّر المرحلة فقط."""
+    arrow = "🟢 صاعد" if m1["dir"] == "bull" else "🔴 هابط"
+    lines = []
+    if lc["stage"] != old["stage"]:
+        lines.append(f"{STAGE_TXT[lc['stage']]} | {sym} {arrow}")
+    if lc["confirmed"] and not old["conf"]:
+        lines.append(f"✅ تأكد على 4س | {sym} {arrow}")
+    if lc["warn"] and not old["warn"]:
+        lines.append(f"⚠️ {sym}: كسر وقف 1 ({lc['stop1']:.2f}) — الإلغاء عند وقف 2 ({lc['stop2']:.2f})")
+    lines.append(f"السعر {price:.2f} | كسر {m1['level']:.2f}")
+    if lc["stage"] not in TERMINAL and lc["targets"]:
+        lines.append("الأهداف: " + ", ".join(f"{t:.2f}" for t in lc["targets"]))
+    return "\n".join(lines)
+
+
 def process(sym, s):
     d1, d4 = load(sym)
     r1, r4 = analyze(d1), analyze(d4)
@@ -172,14 +189,26 @@ def process(sym, s):
     ts = d1.index[-1].strftime("%H:%M")
     cid = s["chat_id"]
 
-    # 1) إشارة الكسر (تتغير حالتها فقط)
-    m1, m4 = last_mss(r1), last_mss(r4)
+    # 1) دورة الصفقة (رسالة فقط عند تغيّر المرحلة)
+    m1 = last_mss(r1)
     if m1:
-        confirmed = bool(m4) and m4["dir"] == m1["dir"]
-        key = f"{m1['dir']}|{round(m1['level'], 2)}|{confirmed}|{m1['retest']}"
-        if key != s["sent"].get(sym):
-            send(cid, "🔔 " + report(sym, (d1, d4, r1, r4)))
-            s["sent"][sym] = key
+        lc = lifecycle(r1, r4, m1)
+        trade = f"{m1['dir']}|{round(m1['level'], 2)}"
+        cur = dict(trade=trade, stage=lc["stage"], warn=lc["warn"],
+                   conf=lc["confirmed"])
+        old = s["life"].get(sym)
+        if old != cur:
+            if old is None and lc["stage"] in TERMINAL:
+                pass                       # صفقة قديمة منتهية: نسجلها بصمت
+            elif old is None or old["trade"] != trade:
+                prefix = ""
+                if (old and old["stage"] not in TERMINAL
+                        and old["trade"].split("|")[0] != m1["dir"]):
+                    prefix = "❌ انتهت الصفقة السابقة (MSS معاكس على الساعة)\n\n"
+                send(cid, prefix + "🔔 " + report(sym, (d1, d4, r1, r4)))
+            else:
+                send(cid, short_text(sym, price, m1, lc, old))
+            s["life"][sym] = cur
 
     # 2) تنبيه الاقتراب
     near = near_info(r1, r4, price)
@@ -187,8 +216,8 @@ def process(sym, s):
     for tf in ("1H", "4H"):
         v = near[tf]
         nk = f"{v['dir']}|{round(v['level'], 2)}" if v else None
-        old = s["near"].get(f"{sym}|{tf}")
-        if nk and nk != old:
+        old_n = s["near"].get(f"{sym}|{tf}")
+        if nk and nk != old_n:
             new = True
         s["near"][f"{sym}|{tf}"] = nk
     if new:
