@@ -7,6 +7,7 @@ L = R = 3            # طول البيفوت (يسار / يمين)
 IFVG_LOOKBACK = 40   # كم شمعة نرجع للخلف لنبحث عن IFVG قبل الكسر
 IFVG_TF = "1H"       # "1H" أو "4H" أو "BOTH"
 TARGET_TF = "4H"     # فريم الأهداف: "1H" أو "4H"
+NEAR_USD = 2.0       # نطاق تنبيه الاقتراب بالدولار
 
 
 def load(symbol):
@@ -76,12 +77,32 @@ def analyze(df):
                     e["retest"] = True
 
     return dict(df=df, events=events, trend=trend,
-                swing_highs=swing_highs, swing_lows=swing_lows)
+                swing_highs=swing_highs, swing_lows=swing_lows,
+                sh=sh, sl=sl, sh_used=sh_used, sl_used=sl_used)
 
 
 def last_mss(res):
     mss = [e for e in res["events"] if e["kind"] == "MSS"]
     return mss[-1] if mss else None
+
+
+def near_info(r1, r4, price):
+    """مستوى MSS لم ينكسر بعد والسعر ضمن NEAR_USD منه، لكل فريم."""
+    out = {}
+    for tf, r in (("1H", r1), ("4H", r4)):
+        info = None
+        # ترند صاعد: MSS هابط يحتاج كسر آخر قاع (السعر فوقه)
+        if r["trend"] == 1 and r["sl"] is not None and not r["sl_used"]:
+            d = price - r["sl"]
+            if 0 <= d <= NEAR_USD:
+                info = dict(dir="bear", level=float(r["sl"]), dist=float(d))
+        # ترند هابط: MSS صاعد يحتاج كسر آخر قمة (السعر تحتها)
+        elif r["trend"] == -1 and r["sh"] is not None and not r["sh_used"]:
+            d = r["sh"] - price
+            if 0 <= d <= NEAR_USD:
+                info = dict(dir="bull", level=float(r["sh"]), dist=float(d))
+        out[tf] = info
+    return out
 
 
 def merge(m1, m4):
@@ -93,9 +114,12 @@ def merge(m1, m4):
     return ifs
 
 
-def report(symbol):
-    d1, d4 = load(symbol)
-    r1, r4 = analyze(d1), analyze(d4)
+def report(symbol, pre=None):
+    if pre is None:
+        d1, d4 = load(symbol)
+        r1, r4 = analyze(d1), analyze(d4)
+    else:
+        d1, d4, r1, r4 = pre
     m1, m4 = last_mss(r1), last_mss(r4)
     price = d1["Close"].iloc[-1]
     if not m1:
