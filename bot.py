@@ -3,12 +3,17 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from scanner import (load, analyze, last_mss, report, near_info, NEAR_USD)
 
-TOKEN = os.getenv("BOT_TOKEN", "8903554903:AAEIYKzWbc1P0QxLcHrXwBTET7w_z25zOaY")
+TOKEN = os.environ["BOT_TOKEN"]          # التوكن من المتغيرات السرية فقط
 API = f"https://api.telegram.org/bot{TOKEN}"
 STATE = "state.json"
-INTERVAL = 15 * 60
+INTERVAL = 5 * 60                        # فحص كل 5 دقائق
 TEST_WORDS = ("/test", "test", "تست")
 VERSION = 2
+NY = ZoneInfo("America/New_York")
+SCAN_START = 8 * 60 + 30                 # 8:30 صباحاً نيويورك
+SCAN_END = 16 * 60                       # 4:00 عصراً نيويورك
+SUMMARIES = {"am": 8 * 60, "pm": 16 * 60 + 15}   # 8:00 و 4:15
+SUMMARY_GRACE = 30                       # دقائق سماح لإرسال الملخص
 DEFAULT_SYMBOLS = [
     "TSLA", "META", "AMD", "NVDA", "MU", "AAPL", "MSFT",
     "SNDK", "QQQ", "CRCL", "COIN", "CRWV", "QCOM", "AMZN", "BA",
@@ -23,6 +28,7 @@ def load_state():
     s.setdefault("offset", 0)
     s.setdefault("sent", {})
     s.setdefault("near", {})
+    s.setdefault("summaries", {})
     if s.get("ver") != VERSION:           # تحديث قائمة الشركات مرة واحدة
         s["symbols"] = list(DEFAULT_SYMBOLS)
         s["ver"] = VERSION
@@ -40,10 +46,55 @@ def send(chat_id, text):
     time.sleep(0.5)
 
 
-def market_open():
-    now = datetime.now(ZoneInfo("America/New_York"))
-    mins = now.hour * 60 + now.minute
-    return now.weekday() < 5 and 570 <= mins <= 960
+def ny_now():
+    now = datetime.now(NY)
+    return now, now.hour * 60 + now.minute
+
+
+def scan_window_open():
+    now, mins = ny_now()
+    return now.weekday() < 5 and SCAN_START <= mins <= SCAN_END
+
+
+def status_board(s, title):
+    """لوحة حالة كل الأسهم: آخر كسر MSS على الساعة والاتجاه ومستواه."""
+    lines = [title]
+    for sym in s["symbols"]:
+        try:
+            d1, d4 = load(sym)
+            r1, r4 = analyze(d1), analyze(d4)
+            price = float(d1["Close"].iloc[-1])
+            m1, m4 = last_mss(r1), last_mss(r4)
+            if not m1:
+                lines.append(f"• {sym} {price:.2f} — لا يوجد كسر نشط")
+                continue
+            arrow = "🟢 صاعد" if m1["dir"] == "bull" else "🔴 هابط"
+            conf = " ✅ مؤكد 4س" if (m4 and m4["dir"] == m1["dir"]) else ""
+            retest = " | إعادة اختبار ✔" if m1["retest"] else ""
+            lines.append(f"• {sym} {price:.2f} — {arrow} عند "
+                         f"{m1['level']:.2f}{conf}{retest}")
+        except Exception as e:
+            lines.append(f"• {sym} — خطأ {e}")
+    return "\n".join(lines)
+
+
+def due_summaries(s):
+    now, mins = ny_now()
+    if now.weekday() >= 5:
+        return
+    day = now.strftime("%Y-%m-%d")
+    for name, at in SUMMARIES.items():
+        key = f"{day}|{name}"
+        if at <= mins <= at + SUMMARY_GRACE and key not in s["summaries"]:
+            if s["chat_id"]:
+                title = ("🌅 ملخص ما قبل الافتتاح" if name == "am"
+                         else "🌇 ملخص نهاية اليوم")
+                send(s["chat_id"], status_board(s, title))
+            s["summaries"][key] = True
+    # تنظيف القديم
+    s["summaries"] = {k: v for k, v in s["summaries"].items()
+                      if k.startswith(day)}
+    save_state(s)
 
 
 def poll_commands(s):
@@ -67,17 +118,19 @@ def poll_commands(s):
             s["chat_id"] = cid
             send(cid, "تم التفعيل ✅\n/add TSLA NVDA  إضافة\n"
                       "/remove TSLA  حذف\n/list  عرض القائمة\n"
+                      "/status  لوحة حالة كل الأسهم\n"
                       "/now TSLA  فحص فوري\ntest  اختبار البوت")
         elif cid != s["chat_id"]:
             continue
         elif cmd in TEST_WORDS:
-            status = "مفتوح 🟢" if market_open() else "مغلق 🔴 (الفحص يبدأ 9:30 نيويورك)"
+            status = ("مفتوح 🟢" if scan_window_open()
+                      else "مغلق 🔴 (الفحص من 8:30 إلى 4:00 نيويورك)")
             send(cid, "✅ البوت شغال\n"
-                      f"السوق الآن: {status}\n"
+                      f"الفحص الآن: {status}\n"
                       f"عدد الشركات: {len(s['symbols'])}\n"
                       f"{', '.join(s['symbols'])}\n"
                       f"تنبيه الاقتراب: ضمن {NEAR_USD:g}$ من كسر هيكل MSS (الساعة و4س)\n"
-                      "الفحص القادم بعد 5 دقائق تقريباً، وسترسل لك الإشارات عند ظهورها.")
+                      "الفحص كل 5 دقائق، وملخص يومي 8:00 ص و4:15 م نيويورك.")
         elif cmd == "/add":
             for a in args:
                 if a not in s["symbols"]:
@@ -88,6 +141,8 @@ def poll_commands(s):
             send(cid, "القائمة: " + ", ".join(s["symbols"]))
         elif cmd == "/list":
             send(cid, "القائمة: " + ", ".join(s["symbols"]))
+        elif cmd == "/status":
+            send(cid, status_board(s, "📊 حالة الأسهم الآن"))
         elif cmd == "/now":
             for a in args:
                 try:
@@ -141,7 +196,7 @@ def process(sym, s):
 
 
 def scan(s):
-    if not s["chat_id"]:
+    if not s["chat_id"] or not scan_window_open():
         return
     for sym in s["symbols"]:
         try:
@@ -157,6 +212,7 @@ if __name__ == "__main__":
     while True:
         try:
             poll_commands(s)
+            due_summaries(s)
             if time.time() - last >= INTERVAL:
                 scan(s)
                 last = time.time()
