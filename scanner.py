@@ -8,6 +8,18 @@ IFVG_LOOKBACK = 40   # كم شمعة نرجع للخلف لنبحث عن IFVG ق
 IFVG_TF = "1H"       # "1H" أو "4H" أو "BOTH"
 TARGET_TF = "4H"     # فريم الأهداف: "1H" أو "4H"
 NEAR_USD = 2.0       # نطاق تنبيه الاقتراب بالدولار
+MAX_DAYS = 3         # انتهاء الصفقة بعد 3 أيام تداول
+
+STAGE_TXT = {
+    "broke": "🔔 كسر — بانتظار إعادة اختبار",
+    "retest": "🔁 إعادة اختبار تمت",
+    "t1": "🎯 الهدف 1 تحقق",
+    "t2": "🏁 الهدف 2 تحقق — انتهت الصفقة",
+    "stopped": "🛑 ألغيت الصفقة (كسر وقف 2)",
+    "chase": "🚫 لا تطارد — وصل الهدف 1 بدون إعادة اختبار",
+    "expired": "⌛ انتهت (3 أيام تداول)",
+}
+TERMINAL = {"t2", "stopped", "chase", "expired"}
 
 
 def load(symbol):
@@ -105,13 +117,82 @@ def near_info(r1, r4, price):
     return out
 
 
-def merge(m1, m4):
-    if not m1 or not m4:
-        return None
+def pick_ifvg(m1, m4, confirmed):
     ifs = []
-    if IFVG_TF in ("1H", "BOTH") and m1["ifvg"]: ifs.append(m1["ifvg"])
-    if IFVG_TF in ("4H", "BOTH") and m4["ifvg"]: ifs.append(m4["ifvg"])
-    return ifs
+    if confirmed:
+        if IFVG_TF in ("1H", "BOTH") and m1["ifvg"]: ifs.append(m1["ifvg"])
+        if IFVG_TF in ("4H", "BOTH") and m4["ifvg"]: ifs.append(m4["ifvg"])
+    elif m1["ifvg"]:
+        ifs.append(m1["ifvg"])
+    return ifs[0] if ifs else None
+
+
+def lifecycle(r1, r4, m1):
+    """دورة الصفقة منذ شمعة الكسر: broke → retest → t1 → t2
+    أو نهاية: stopped / chase / expired. وتحذير warn عند كسر وقف 1."""
+    df = r1["df"]
+    h, l, c = df["High"].values, df["Low"].values, df["Close"].values
+    idx = df.index
+    i0 = m1["i"]
+    bull = m1["dir"] == "bull"
+    m4 = last_mss(r4)
+    confirmed = bool(m4) and m4["dir"] == m1["dir"]
+    ifvg = pick_ifvg(m1, m4, confirmed)
+
+    # وقف 1: خلف الـ IFVG (أو مستوى الكسر إن لم يوجد)
+    if bull:
+        stop1 = (ifvg["bot"] if ifvg else m1["level"]) - 0.01
+        prev = [p for t, p in r1["swing_lows"] if t < idx[i0]]
+        stop2 = min((prev[-1] if prev else stop1) - 0.01, stop1)
+        ret_lvl = max(m1["level"], ifvg["top"]) if ifvg else m1["level"]
+    else:
+        stop1 = (ifvg["top"] if ifvg else m1["level"]) + 0.01
+        prev = [p for t, p in r1["swing_highs"] if t < idx[i0]]
+        stop2 = max((prev[-1] if prev else stop1) + 0.01, stop1)
+        ret_lvl = min(m1["level"], ifvg["bot"]) if ifvg else m1["level"]
+
+    # الأهداف ثابتة من مستوى الكسر (لا تتحرك مع السعر)
+    src = r4 if TARGET_TF == "4H" else r1
+    if bull:
+        tg = sorted(p for _, p in src["swing_highs"] if p > m1["level"])[:2]
+    else:
+        tg = sorted((p for _, p in src["swing_lows"] if p < m1["level"]),
+                    reverse=True)[:2]
+    t1 = tg[0] if len(tg) > 0 else None
+    t2 = tg[1] if len(tg) > 1 else None
+
+    stage, warn, retest = "broke", False, False
+
+    def out(st):
+        return dict(stage=st, warn=warn, retest=retest, stop1=stop1,
+                    stop2=stop2, targets=tg, ifvg=ifvg, confirmed=confirmed)
+
+    for j in range(i0 + 1, len(df)):
+        # إلغاء الصفقة: إغلاق خلف وقف 2
+        if (bull and c[j] < stop2) or (not bull and c[j] > stop2):
+            return out("stopped")
+        # تحذير: إغلاق خلف وقف 1
+        if (bull and c[j] < stop1) or (not bull and c[j] > stop1):
+            warn = True
+        # إعادة الاختبار
+        if not retest and ((bull and l[j] <= ret_lvl) or (not bull and h[j] >= ret_lvl)):
+            retest, stage = True, "retest"
+        # الأهداف
+        if t1 is not None:
+            hit1 = h[j] >= t1 if bull else l[j] <= t1
+            if hit1 and not retest:
+                return out("chase")
+            if hit1 and stage in ("broke", "retest"):
+                stage = "t1"
+        if t2 is not None and stage == "t1":
+            hit2 = h[j] >= t2 if bull else l[j] <= t2
+            if hit2:
+                return out("t2")
+        # انتهاء المدة: 3 أيام تداول بعد يوم الكسر
+        days = len({ts.date() for ts in idx[i0:j + 1]}) - 1
+        if days >= MAX_DAYS:
+            return out("expired")
+    return out(stage)
 
 
 def report(symbol, pre=None):
@@ -120,36 +201,26 @@ def report(symbol, pre=None):
         r1, r4 = analyze(d1), analyze(d4)
     else:
         d1, d4, r1, r4 = pre
-    m1, m4 = last_mss(r1), last_mss(r4)
+    m1 = last_mss(r1)
     price = d1["Close"].iloc[-1]
     if not m1:
         return f"{symbol}: لا يوجد MSS على الساعة"
 
-    confirmed = bool(m4) and m1["dir"] == m4["dir"]
+    lc = lifecycle(r1, r4, m1)
     arrow = "صعود 🟢" if m1["dir"] == "bull" else "هبوط 🔴"
-    status = f"{arrow} {'مثبت (الساعة + 4س)' if confirmed else 'بانتظار تأكيد 4س'}"
-
-    ifs = merge(m1, m4) if confirmed else ([m1["ifvg"]] if m1["ifvg"] else [])
-    ifvg = ifs[0] if ifs else None
+    status = f"{arrow} {'مثبت (الساعة + 4س)' if lc['confirmed'] else 'بانتظار تأكيد 4س'}"
+    ifvg = lc["ifvg"]
     ifvg_txt = f"{ifvg['bot']:.2f} → {ifvg['top']:.2f}" if ifvg else "لا يوجد"
-    retest = "تم ✓" if m1["retest"] else "بانتظار إعادة الاختبار"
-
-    if m1["dir"] == "bull":
-        stop = (ifvg["bot"] if ifvg else m1["level"]) - 0.01
-        src = r4 if TARGET_TF == "4H" else r1
-        tg = sorted(p for _, p in src["swing_highs"] if p > price)[:2]
-    else:
-        stop = (ifvg["top"] if ifvg else m1["level"]) + 0.01
-        src = r4 if TARGET_TF == "4H" else r1
-        tg = sorted((p for _, p in src["swing_lows"] if p < price), reverse=True)[:2]
+    warn = "\n  ⚠️ تم كسر وقف 1" if lc["warn"] else ""
 
     return (f"{symbol} | السعر {price:.2f}\n"
             f"  الحالة: {status}\n"
+            f"  المرحلة: {STAGE_TXT[lc['stage']]}{warn}\n"
             f"  سعر الكسر: {m1['level']:.2f}\n"
             f"  IFVG قبل الكسر: {ifvg_txt}\n"
-            f"  إعادة الاختبار: {retest}\n"
-            f"  وقف الخسارة: {stop:.2f}\n"
-            f"  الأهداف: {', '.join(f'{t:.2f}' for t in tg) or 'لا يوجد'}\n")
+            f"  وقف 1 (خلف IFVG): {lc['stop1']:.2f}\n"
+            f"  وقف 2 (إلغاء الهيكل): {lc['stop2']:.2f}\n"
+            f"  الأهداف: {', '.join(f'{t:.2f}' for t in lc['targets']) or 'لا يوجد'}\n")
 
 
 if __name__ == "__main__":
