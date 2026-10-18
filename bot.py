@@ -3,6 +3,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from scanner import (load, analyze, last_mss, report, near_info, lifecycle,
                      NEAR_USD, STAGE_TXT, TERMINAL)
+from bot_extras import detect_sweep, volume_check, make_chart, send_photo
 
 TOKEN = os.environ["BOT_TOKEN"]          # يُقرأ من المتغيرات السرية، لا يُكتب هنا
 API = f"https://api.telegram.org/bot{TOKEN}"
@@ -216,6 +217,33 @@ def short_text(sym, price, m1, lc, old):
     return "\n".join(lines)
 
 
+def send_signal(cid, sym, d1, m1, lc, text):
+    """إشارة الكسر كصورة شارت + نص. إن فشل الرسم يرسل النص فقط."""
+    try:
+        d = 1 if m1["dir"] == "bull" else -1
+        sweep = detect_sweep(d1, d, m1["i"])
+        vol_ok, ratio = volume_check(
+            d1, [m1["i"], sweep["sweep_idx"] if sweep else None])
+        z = lc["ifvg"]
+        sig = {
+            "direction": d, "kind": m1["kind"],
+            "brk_idx": m1["i"], "brk_level": float(m1["level"]),
+            "ifvg": ({"top": float(z["top"]), "bot": float(z["bot"]),
+                      "start_idx": int(z["idx"])} if z else None),
+            "stop": float(lc["stop1"]),
+            "targets": [float(t) for t in lc["targets"]],
+        }
+        extra = ("\n  سحب سيولة: ✅ " + sweep["kind"] + f" عند {sweep['level']:.2f}"
+                 if sweep else "\n  سحب سيولة: ❌ لا يوجد")
+        extra += f"\n  الفوليوم: {'✅' if vol_ok else '❌'} ({ratio}× المتوسط)"
+        png = make_chart(d1, sym, "1H", sig, sweep)
+        send_photo(TOKEN, cid, png, text + extra)
+        time.sleep(0.5)
+    except Exception as e:
+        print(sym, "chart خطأ", e)
+        send(cid, text)
+
+
 def process(sym, s):
     d1, d4 = load(sym)
     r1, r4 = analyze(d1), analyze(d4)
@@ -237,7 +265,8 @@ def process(sym, s):
             if (old and old["stage"] not in TERMINAL
                     and old["trade"].split("|")[0] != m1["dir"]):
                 prefix = "❌ انتهت الصفقة السابقة (MSS معاكس على الساعة)\n\n"
-            send(cid, prefix + "🔔 " + report(sym, (d1, d4, r1, r4)))
+            send_signal(cid, sym, d1, m1, lc,
+                        prefix + "🔔 " + report(sym, (d1, d4, r1, r4)))
         elif old["stage"] != cur["stage"] or old["warn"] != cur["warn"]:
             send(cid, short_text(sym, price, m1, lc, old))
         s["life"][sym] = cur
