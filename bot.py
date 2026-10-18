@@ -9,7 +9,8 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 STATE = "state.json"
 INTERVAL = 5 * 60                        # فحص كل 5 دقائق
 TEST_WORDS = ("/test", "test", "تست")
-VERSION = 2
+STATUS_WORDS = ("/status", "status", "ستاتوس", "الحالة", "حالة")
+VERSION = 3
 NY = ZoneInfo("America/New_York")
 SCAN_START = 8 * 60 + 30                 # 8:30 صباحاً نيويورك
 SCAN_END = 16 * 60                       # 4:00 عصراً نيويورك
@@ -117,10 +118,12 @@ def poll_commands(s):
 
         if cmd == "/start":
             s["chat_id"] = cid
-            send(cid, "تم التفعيل ✅\n/add TSLA NVDA  إضافة\n"
+            send(cid, "تم التفعيل ✅\n"
+                      "اكتب اسم سهم (مثل TSLA) ويرسل لك تقريره\n"
+                      "اكتب status أو ستاتوس للوحة كل الأسهم\n"
+                      "/add TSLA NVDA  إضافة\n"
                       "/remove TSLA  حذف\n/list  عرض القائمة\n"
-                      "/status  لوحة حالة كل الأسهم\n"
-                      "/now TSLA  فحص فوري\ntest  اختبار البوت")
+                      "test  اختبار البوت")
         elif cid != s["chat_id"]:
             continue
         elif cmd in TEST_WORDS:
@@ -132,6 +135,8 @@ def poll_commands(s):
                       f"{', '.join(s['symbols'])}\n"
                       f"تنبيه الاقتراب: ضمن {NEAR_USD:g}$ من كسر هيكل MSS (الساعة و4س)\n"
                       "الفحص كل 5 دقائق، وملخص يومي 8:00 ص و4:15 م نيويورك.")
+        elif cmd in STATUS_WORDS:
+            send(cid, status_board(s, "📊 حالة الأسهم الآن"))
         elif cmd == "/add":
             for a in args:
                 if a not in s["symbols"]:
@@ -142,14 +147,21 @@ def poll_commands(s):
             send(cid, "القائمة: " + ", ".join(s["symbols"]))
         elif cmd == "/list":
             send(cid, "القائمة: " + ", ".join(s["symbols"]))
-        elif cmd == "/status":
-            send(cid, status_board(s, "📊 حالة الأسهم الآن"))
         elif cmd == "/now":
             for a in args:
                 try:
                     send(cid, report(a))
                 except Exception as e:
                     send(cid, f"{a}: خطأ {e}")
+        else:
+            # رسالة فيها أسماء أسهم فقط (TSLA أو NVDA AMD أو $TSLA)
+            names = [t.lstrip("$").upper() for t in parts]
+            if all(n in s["symbols"] for n in names):
+                for n in names:
+                    try:
+                        send(cid, report(n))
+                    except Exception as e:
+                        send(cid, f"{n}: خطأ {e}")
     save_state(s)
 
 
