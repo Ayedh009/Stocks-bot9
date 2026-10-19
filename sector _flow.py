@@ -1,12 +1,10 @@
 # sector_flow.py
-import os, json, datetime as dt
+import datetime as dt
 from zoneinfo import ZoneInfo
 import numpy as np
-import requests
 import yfinance as yf
 
 NY = ZoneInfo("America/New_York")
-STATE_FILE = "sector_state.json"
 MIN_RVOL = 1.2  # أقل حجم نسبي نعتبره دخول سيولة حقيقي
 
 # القطاعات: الصندوق + أسهمك + قادة القطاع (عدّلها كما تريد)
@@ -27,34 +25,6 @@ SECTORS = {
 }
 
 
-# ---------- إرسال تيليجرام (أو مرّر دالة الإرسال الموجودة عندك) ----------
-def default_send(text):
-    token = os.environ["BOT_TOKEN"]      # غيّر الاسم لو سرّك عندك باسم ثاني
-    chat_id = os.environ["CHAT_ID"]
-    requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-        timeout=20,
-    )
-
-
-# ---------- الحالة ----------
-def load_state(today):
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            s = json.load(f)
-        if s.get("date") == today:
-            return s
-    except Exception:
-        pass
-    return {"date": today, "open_sent": False, "leader": None, "pending": None, "last_sent": None}
-
-
-def save_state(s):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(s, f, ensure_ascii=False)
-
-
 # ---------- قياس السيولة لكل قطاع ----------
 def measure_flow():
     etfs = [v["etf"] for v in SECTORS.values()]
@@ -68,6 +38,8 @@ def measure_flow():
     out = {}
     for name, v in SECTORS.items():
         e = v["etf"]
+        if e not in vol:
+            continue
         ve, ce = vol[e].dropna(), close[e].dropna()
         if ve.empty:
             continue
@@ -140,13 +112,18 @@ def build_message(title, flows, leader, note=""):
     return "\n".join(lines)
 
 
-# ---------- التشغيل (استدعها كل 5 دقائق) ----------
-def run_sector_report(send=default_send):
+# ---------- التشغيل (يُستدعى كل 5 دقائق من bot_once.py) ----------
+def run_sector_report(s, send):
     now = dt.datetime.now(NY)
     if now.weekday() >= 5 or not (dt.time(9, 30) <= now.time() <= dt.time(16, 0)):
         return
 
-    state = load_state(str(now.date()))
+    today = str(now.date())
+    state = s.get("sector")
+    if not state or state.get("date") != today:
+        state = {"date": today, "open_sent": False, "leader": None, "pending": None, "last_sent": None}
+    s["sector"] = state
+
     flows = measure_flow()
     if not flows:
         return
@@ -179,4 +156,3 @@ def run_sector_report(send=default_send):
     if message:
         send(message)
         state["last_sent"] = now.isoformat()
-    save_state(state)
