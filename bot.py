@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 from scanner import (load, analyze, last_mss, report, near_info, lifecycle,
                      NEAR_USD, STAGE_TXT, TERMINAL)
 from bot_extras import detect_sweep, volume_check, make_chart, send_photo
+from spx_logic import spx_process, spx_report
 
 TOKEN = os.environ["BOT_TOKEN"]          # يُقرأ من المتغيرات السرية، لا يُكتب هنا
 API = f"https://api.telegram.org/bot{TOKEN}"
@@ -133,6 +134,7 @@ def poll_commands(s):
                       "اكتب status أو ستاتوس للوحة كل الأسهم\n"
                       "/add TSLA NVDA  إضافة\n"
                       "/remove TSLA  حذف\n/list  عرض القائمة\n"
+                      "/spx TSLA  لقطة السباكس للسهم\n"
                       "test  اختبار البوت")
         elif cid != s["chat_id"]:
             continue
@@ -157,6 +159,12 @@ def poll_commands(s):
             send(cid, "القائمة: " + ", ".join(s["symbols"]))
         elif cmd == "/list":
             send(cid, "القائمة: " + ", ".join(s["symbols"]))
+        elif cmd == "/spx":
+            for a in args:
+                try:
+                    send(cid, spx_report(a, load(a)[0]))
+                except Exception as e:
+                    send(cid, f"{a}: خطأ {e}")
         elif cmd == "/now":
             for a in args:
                 try:
@@ -294,6 +302,9 @@ def process(sym, s):
         s["near"][f"{sym}|{tf}"] = nk
     if new:
         send(cid, near_text(sym, price, near, ts))
+
+    # 4) إشارات السباكس (أوردربلوك + كنترول) على هذا السهم
+    spx_process(sym, s, d1, send)
 
 
 def scan(s):
