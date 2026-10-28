@@ -5,6 +5,7 @@ spx_logic.py — منطق السباكس (أوردربلوك + فجوات FVG + 
 
 - إشارة CALL/PUT عند ارتداد مؤكد (إغلاق شمعة) من أوردربلوك أو فجوة
 - دخول + وقف + هدفان، ومتابعة الصفقة (TP1 / TP2 / وقف) برسائل قصيرة
+- تنبيه وصول السعر إلى أوردربلوك + تنبيه إغلاق شمعة عبر خط الكنترول (+ الفجوات اختيارياً)
 - خط الكنترول = متوسط (VWAP الجلسة ، منتصف مدى اليوم) يظهر في الإشارة وفي /spx
 - أمر /spx TSLA : لقطة فورية للسهم
 لا يحتاج مكتبات جديدة (yfinance و pandas موجودتان).
@@ -29,6 +30,13 @@ NO_NEW_AFTER = dtime(15, 30)     # لا إشارات جديدة بعدها
 MAX_SIGNALS_PER_SYMBOL = 2       # أقصى عدد إشارات للسهم الواحد يومياً
 COOLDOWN_MIN = 30                # أقل فاصل بين إشارتين بنفس الاتجاه (لنفس السهم)
 MAX_AGE_MIN = 25                 # لا نرسل إشارة شمعتها أقدم من هذا
+
+# تنبيهات المناطق والكنترول (True = تعمل ، False = متوقفة)
+ALERT_OB_TOUCH = True            # السعر وصل إلى أوردربلوك
+ALERT_CONTROL_CROSS = True       # إغلاق شمعة عبر خط الكنترول
+ALERT_FVG_FORMED = False         # تكوّن فجوة جديدة (كثيرة جداً مع عدد الأسهم)
+MAX_OB_ALERTS = 3                # أقصى تنبيهات أوردربلوك للسهم يومياً
+MAX_CROSS_ALERTS = 4             # أقصى تنبيهات كنترول للسهم يومياً
 
 
 def _now():
@@ -221,7 +229,7 @@ def _snap(sym):
         now=now, sess=sess, today=today, closed=closed,
         closed_today=[c for c in closed if c.t.date() == now.date()],
         price=sess[-1].c, last_t=sess[-1].t, atr5=a,
-        control=ctrl[-1], vwap=vwap,
+        control=ctrl[-1], vwap=vwap, ctrl_series=ctrl,
         day_high=max(c.h for c in today), day_low=min(c.l for c in today))
     zc = closed[-300:]
     ns.zones = find_obs(zc, a) + find_fvgs(zc, a)
@@ -236,7 +244,63 @@ def _state(s, sym, now):
     if not st or st.get("day") != day:
         st = {"day": day, "count": 0, "signaled": [], "last": {}, "trades": []}
         root[sym] = st
+    for key in ("touched", "fvg_seen", "cross_seen"):   # حالات محفوظة من نسخة سابقة
+        st.setdefault(key, [])
     return st
+
+
+# ───────────────────────── تنبيهات الأوردربلوك والكنترول والفجوات ─────────────────────────
+def _alerts(sym, ns, st, cid, send):
+    t = ns.now.time()
+    if t < SIGNAL_START or t > NO_NEW_AFTER or not ns.closed_today:
+        return
+    k = ns.closed_today[-1]
+    age = (ns.now - (k.t + timedelta(minutes=5))).total_seconds() / 60.0
+    if age > MAX_AGE_MIN:
+        return
+
+    # 1) فجوة جديدة
+    if ALERT_FVG_FORMED and len(ns.closed) >= 2:
+        for z in ns.zones:
+            if (z.kind.startswith("FVG") and z.t >= ns.closed[-2].t
+                    and z.id not in st["fvg_seen"]):
+                st["fvg_seen"].append(z.id)
+                send(cid, f"📦 {sym}: تكوّنت {z.name}\n"
+                          f"النطاق: {_f(z.lo)} – {_f(z.hi)}\n"
+                          f"الفريم: 5 دقائق | السعر الآن: {_f(ns.price)}\n"
+                          + _stamp(z.t, "شمعة تكوّن الفجوة"))
+
+    # 2) وصول السعر إلى أوردربلوك
+    if ALERT_OB_TOUCH and len(st["touched"]) < MAX_OB_ALERTS:
+        for z in ns.zones:
+            if not z.kind.startswith("OB") or z.id in st["touched"]:
+                continue
+            near = (z.lo - 0.15 * ns.atr5 <= ns.price <= z.hi + 0.15 * ns.atr5)
+            if near and z.t < k.t:
+                st["touched"].append(z.id)
+                side = "شراء 🟢" if z.bullish else "بيع 🔴"
+                send(cid, f"🧱 {sym}: السعر عند منطقة {z.name} ({side})\n"
+                          f"النطاق: {_f(z.lo)} – {_f(z.hi)}\n"
+                          f"السعر الآن: {_f(ns.price)}\n"
+                          + _stamp(ns.last_t, "آخر شمعة في البيانات"))
+                break
+
+    # 3) إغلاق شمعة عبر خط الكنترول
+    tc = ns.closed_today
+    if (ALERT_CONTROL_CROSS and len(st["cross_seen"]) < MAX_CROSS_ALERTS
+            and len(tc) >= 2 and len(ns.ctrl_series) >= len(tc)):
+        cs_ = ns.ctrl_series[len(tc) - 1]
+        ps_ = ns.ctrl_series[len(tc) - 2]
+        up = tc[-2].c <= ps_ and tc[-1].c > cs_
+        dn = tc[-2].c >= ps_ and tc[-1].c < cs_
+        key = int(tc[-1].t.timestamp())
+        if (up or dn) and key not in st["cross_seen"]:
+            st["cross_seen"].append(key)
+            head = ("إغلاق شمعة فوق خط الكنترول — انحياز صاعد 🟢" if up else
+                    "إغلاق شمعة تحت خط الكنترول — انحياز هابط 🔴")
+            send(cid, f"⚡ {sym}: {head}\n"
+                      f"الكنترول: {_f(cs_)} | الإغلاق: {_f(tc[-1].c)}\n"
+                      + _stamp(tc[-1].t, "شمعة الاختراق"))
 
 
 # ───────────────────────── الإشارات ─────────────────────────
@@ -365,6 +429,7 @@ def spx_process(sym, s, d1, send):
             return
         st = _state(s, sym, ns.now)
         _track(sym, ns, st, cid, send)
+        _alerts(sym, ns, st, cid, send)
         _signals(sym, ns, st, _bias_from(d1), cid, send)
     except Exception as e:
         print(sym, "spx error:", e)
