@@ -28,12 +28,29 @@ DEFAULT_SYMBOLS = [
 ]
 TF_NAME = {"1H": "الساعة", "4H": "4 ساعات"}
 
-# كل المحادثات اللي تصلها التنبيهات (رقمك + القروب) من السر CHAT_ID مفصولة بفاصلة
 ALL = "ALL"
-ALERT_IDS = []
-for _x in os.getenv("CHAT_ID", "").replace(" ", "").split(","):
-    if _x.lstrip("-").isdigit():
-        ALERT_IDS.append(int(_x))
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+
+
+def parse_ids(raw):
+    """يقرأ أرقام المحادثات من السر CHAT_ID. يقبل الأرقام العربية والفاصلة العربية
+    والشرطات المختلفة والمسافات والأسطر الجديدة."""
+    raw = (raw or "").translate(_AR_DIGITS)
+    for ch in "،؛;\n\r\t ":
+        raw = raw.replace(ch, ",")
+    for ch in "−–—‒﹣－":
+        raw = raw.replace(ch, "-")
+    ids = []
+    for x in raw.split(","):
+        x = x.strip()
+        if x.lstrip("-").isdigit() and int(x) not in ids:
+            ids.append(int(x))
+    return ids
+
+
+# كل المحادثات اللي تصلها التنبيهات (رقمك + القروب) من السر CHAT_ID
+ALERT_IDS = parse_ids(os.getenv("CHAT_ID", ""))
+_REPORTED = set()
 
 
 def load_state():
@@ -59,15 +76,68 @@ def save_state(s):
     json.dump(s, open(STATE, "w"))
 
 
+def note_fail(cid, r):
+    """إذا رفض تيليجرام الإرسال لمحادثة، يبلغ المحادثة الأولى بالسبب."""
+    try:
+        d = r.json()
+    except Exception:
+        d = {}
+    desc = d.get("description", r.text[:120])
+    mig = (d.get("parameters") or {}).get("migrate_to_chat_id")
+    print("send رفض", cid, desc)
+    if cid in _REPORTED or not ALERT_IDS or cid == ALERT_IDS[0]:
+        return
+    _REPORTED.add(cid)
+    msg = f"⚠️ تعذر الإرسال إلى {cid}\nالسبب: {desc}"
+    if mig:
+        msg += f"\nالرقم الجديد للقروب: {mig} (حدّثه في السر CHAT_ID)"
+    try:
+        requests.post(f"{API}/sendMessage",
+                      data={"chat_id": ALERT_IDS[0], "text": msg}, timeout=20)
+    except Exception as e:
+        print("note_fail خطأ", e)
+
+
 def send(chat_id, text):
     ids = ALERT_IDS if chat_id == ALL else [chat_id]
     for cid in ids:
         try:
-            requests.post(f"{API}/sendMessage",
-                          data={"chat_id": cid, "text": text}, timeout=20)
+            r = requests.post(f"{API}/sendMessage",
+                              data={"chat_id": cid, "text": text}, timeout=20)
+            if not r.ok:
+                note_fail(cid, r)
         except Exception as e:
             print("send خطأ", cid, e)
         time.sleep(0.3)
+
+
+def chats_report():
+    """فحص كل رقم في CHAT_ID: هل موجود، نوعه، وحالة البوت فيه."""
+    me = requests.get(f"{API}/getMe", timeout=20).json().get("result", {})
+    lines = [f"🤖 البوت: @{me.get('username', '?')}",
+             f"عدد المحادثات في CHAT_ID: {len(ALERT_IDS)}"]
+    kinds = {"private": "خاص", "group": "قروب", "supergroup": "قروب", "channel": "قناة"}
+    for c in ALERT_IDS:
+        try:
+            r = requests.get(f"{API}/getChat", params={"chat_id": c}, timeout=20).json()
+            if r.get("ok"):
+                ch = r["result"]
+                title = ch.get("title") or ch.get("first_name") or "؟"
+                kind = kinds.get(ch.get("type"), ch.get("type"))
+                st = ""
+                if ch.get("type") != "private":
+                    m = requests.get(f"{API}/getChatMember",
+                                     params={"chat_id": c, "user_id": me.get("id")},
+                                     timeout=20).json()
+                    st = f" | حالة البوت: {(m.get('result') or {}).get('status', '؟')}"
+                lines.append(f"✅ {c} — {kind}: {title}{st}")
+            else:
+                mig = (r.get("parameters") or {}).get("migrate_to_chat_id")
+                extra = f"\n   الرقم الجديد: {mig}" if mig else ""
+                lines.append(f"❌ {c} — {r.get('description', '')}{extra}")
+        except Exception as e:
+            lines.append(f"❌ {c} — خطأ {e}")
+    return "\n".join(lines)
 
 
 def ny_now():
@@ -212,6 +282,7 @@ def poll_commands(s):
                           "/add TSLA NVDA  إضافة\n"
                           "/remove TSLA  حذف\n/list  عرض القائمة\n"
                           "/spx TSLA  لقطة السباكس للسهم\n"
+                          "/chats  فحص المحادثات المرتبطة (الخاص والقروب)\n"
                           "test  اختبار البوت")
         elif cid not in ALERT_IDS:
             continue
@@ -225,6 +296,11 @@ def poll_commands(s):
                       f"عدد المحادثات المرتبطة: {len(ALERT_IDS)}\n"
                       f"تنبيه الاقتراب: ضمن {NEAR_USD:g}$ من كسر هيكل MSS (الساعة و4س)\n"
                       "الفحص كل 5 دقائق، وملخص يومي 8:00 ص و4:15 م نيويورك.")
+        elif cmd == "/chats":
+            try:
+                send(cid, chats_report())
+            except Exception as e:
+                send(cid, f"تعذر الفحص: {e}")
         elif cmd in STATUS_WORDS:
             send(cid, status_board(s, "📊 حالة الأسهم الآن"))
         elif cmd == "/add":
