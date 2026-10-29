@@ -1,6 +1,7 @@
 import os, re, json, time, requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import yfinance as yf
 from scanner import (load, analyze, last_mss, report, near_info, lifecycle,
                      NEAR_USD, STAGE_TXT, TERMINAL)
 from bot_extras import detect_sweep, volume_check, make_chart, send_photo
@@ -14,6 +15,8 @@ TEST_WORDS = ("/test", "test", "تست")
 STATUS_WORDS = ("/status", "status", "ستاتوس", "الحالة", "حالة")
 VERSION = 3
 NY = ZoneInfo("America/New_York")
+LOCAL = ZoneInfo(os.getenv("LOCAL_TZ", "America/Chicago"))
+LOCAL_NAME = os.getenv("LOCAL_TZ_NAME", "شيكاغو")
 SCAN_START = 8 * 60 + 30                 # 8:30 صباحاً نيويورك
 SCAN_END = 16 * 60                       # 4:00 عصراً نيويورك
 SUMMARIES = {"am": 8 * 60, "pm": 16 * 60 + 15}   # 8:00 و 4:15
@@ -77,6 +80,25 @@ def scan_window_open():
     return now.weekday() < 5 and SCAN_START <= mins <= SCAN_END
 
 
+def stamp(sym):
+    """ختم الرسالة: وقت آخر سعر + وقت الإرسال + عمر البيانات (نيويورك وشيكاغو)."""
+    now = datetime.now(NY)
+    sent = f"🕒 أُرسلت {now:%H:%M:%S}"
+    try:
+        h = yf.Ticker(sym).history(period="1d", interval="1m")
+        if len(h):
+            t = h.index[-1].tz_convert(NY) + timedelta(minutes=1)
+            age = max(0.0, (now - t).total_seconds() / 60.0)
+            if age <= 120:
+                return (f"🕯 آخر سعر وصل: {t:%H:%M} نيويورك "
+                        f"({LOCAL_NAME} {t.astimezone(LOCAL):%H:%M})\n"
+                        f"{sent} | عمر البيانات: {age:.1f} د "
+                        f"{'✅' if age <= 2 else '⚠️'}")
+    except Exception as e:
+        print("stamp خطأ", e)
+    return sent + f" نيويورك ({LOCAL_NAME} {now.astimezone(LOCAL):%H:%M})"
+
+
 def quick_report(sym):
     """تحليل قصير وسريع لسهم واحد."""
     d1, d4 = load(sym)
@@ -84,7 +106,7 @@ def quick_report(sym):
     price = float(d1["Close"].iloc[-1])
     ts = d1.index[-1].strftime("%H:%M")
     m1, m4 = last_mss(r1), last_mss(r4)
-    lines = [f"📌 {sym} | {price:.2f} (آخر شمعة {ts} نيويورك)"]
+    lines = [f"📌 {sym} | {price:.2f} (شمعة الساعة بدأت {ts} نيويورك)"]
     if m1:
         lc = lifecycle(r1, r4, m1)
         arrow = "🟢 صاعد" if m1["dir"] == "bull" else "🔴 هابط"
@@ -107,6 +129,7 @@ def quick_report(sym):
             kind = "هابط" if v["dir"] == "bear" else "صاعد"
             lines.append(f"⚠️ قريب من كسر {kind} ({TF_NAME[tf]}) عند "
                          f"{v['level']:.2f} (المسافة {v['dist']:.2f}$)")
+    lines.append(stamp(sym))
     return "\n".join(lines)
 
 
@@ -138,6 +161,7 @@ def status_board(s, title):
     lines += active
     if done:
         lines += ["", "⚪ بدون صفقة نشطة: " + ", ".join(done)]
+    lines += ["", stamp("QQQ")]
     return "\n".join(lines)
 
 
@@ -248,7 +272,7 @@ def near_text(sym, price, near, ts):
     both = (len(active) == 2 and active["1H"]["dir"] == active["4H"]["dir"])
     head = "🔥 تقاطع" if both else "⚠️"
     lines = [f"{head} {sym} قريب من كسر هيكل (MSS)",
-             f"السعر: {price:.2f}  (آخر شمعة {ts} نيويورك)"]
+             f"السعر: {price:.2f}  (شمعة الساعة بدأت {ts} نيويورك)"]
     for tf, v in active.items():
         kind = "هابط 🔴" if v["dir"] == "bear" else "صاعد 🟢"
         lines.append(f"• {TF_NAME[tf]}: كسر {kind} عند {v['level']:.2f} "
@@ -311,6 +335,7 @@ def send_signal(cid, sym, d1, m1, lc, text):
                 send_photo(TOKEN, c, png, text + extra)
             except Exception as e:
                 print(sym, "send_photo خطأ", c, e)
+                send(c, text + extra)
             time.sleep(0.3)
     except Exception as e:
         print(sym, "chart خطأ", e)
@@ -339,9 +364,10 @@ def process(sym, s):
                     and old["trade"].split("|")[0] != m1["dir"]):
                 prefix = "❌ انتهت الصفقة السابقة (MSS معاكس على الساعة)\n\n"
             send_signal(cid, sym, d1, m1, lc,
-                        prefix + "🔔 " + report(sym, (d1, d4, r1, r4)))
+                        prefix + "🔔 " + report(sym, (d1, d4, r1, r4))
+                        + "\n" + stamp(sym))
         elif old["stage"] != cur["stage"] or old["warn"] != cur["warn"]:
-            send(cid, short_text(sym, price, m1, lc, old))
+            send(cid, short_text(sym, price, m1, lc, old) + "\n" + stamp(sym))
         s["life"][sym] = cur
 
     # 2) تنبيه مستقل: كسر هيكل 4 ساعات
@@ -352,7 +378,7 @@ def process(sym, s):
         if k4 != old4:
             recent = m4["i"] >= len(r4["df"]) - 2   # حدث في آخر شمعتين
             if old4 is not None or recent:
-                send(cid, h4_text(sym, price, m4, m1, r4))
+                send(cid, h4_text(sym, price, m4, m1, r4) + "\n" + stamp(sym))
             s["h4"][sym] = k4
 
     # 3) تنبيه الاقتراب
@@ -366,7 +392,7 @@ def process(sym, s):
             new = True
         s["near"][f"{sym}|{tf}"] = nk
     if new:
-        send(cid, near_text(sym, price, near, ts))
+        send(cid, near_text(sym, price, near, ts) + "\n" + stamp(sym))
 
     # 4) إشارات السباكس (أوردربلوك + كنترول) على هذا السهم
     spx_process(sym, s, d1, lambda c, t: send(ALL, t))
