@@ -3,10 +3,11 @@
 spx_logic.py — منطق السباكس (أوردربلوك + فجوات FVG + خط الكنترول + إشارات CALL/PUT)
 مطبّق على كل أسهم بوت الأسهم، على فريم 5 دقائق.
 
+- تنبيه: السعر عند منطقة أوردربلوك (لمس الشمعة الحالية للمنطقة)
+- تنبيه: السعر لمس خط الكنترول + تنبيه إغلاق شمعة عبره
 - إشارة CALL/PUT عند ارتداد مؤكد (إغلاق شمعة) من أوردربلوك أو فجوة
 - دخول + وقف + هدفان، ومتابعة الصفقة (TP1 / TP2 / وقف) برسائل قصيرة
-- تنبيه وصول السعر إلى أوردربلوك + تنبيه إغلاق شمعة عبر خط الكنترول (+ الفجوات اختيارياً)
-- خط الكنترول = متوسط (VWAP الجلسة ، منتصف مدى اليوم) يظهر في الإشارة وفي /spx
+- خط الكنترول = متوسط (VWAP الجلسة ، منتصف مدى اليوم)
 - أمر /spx TSLA : لقطة فورية للسهم
 لا يحتاج مكتبات جديدة (yfinance و pandas موجودتان).
 """
@@ -27,16 +28,23 @@ LOCAL_NAME = os.getenv("LOCAL_TZ_NAME", "شيكاغو")
 OPEN, CLOSE = dtime(9, 30), dtime(16, 0)
 SIGNAL_START = dtime(9, 45)      # لا إشارات قبلها (شموع الافتتاح عشوائية)
 NO_NEW_AFTER = dtime(15, 30)     # لا إشارات جديدة بعدها
+ALERT_START = dtime(9, 35)       # أبكر وقت لتنبيهات اللمس
+ALERT_END = dtime(15, 55)        # آخر وقت لتنبيهات اللمس
 MAX_SIGNALS_PER_SYMBOL = 2       # أقصى عدد إشارات للسهم الواحد يومياً
 COOLDOWN_MIN = 30                # أقل فاصل بين إشارتين بنفس الاتجاه (لنفس السهم)
 MAX_AGE_MIN = 25                 # لا نرسل إشارة شمعتها أقدم من هذا
 
 # تنبيهات المناطق والكنترول (True = تعمل ، False = متوقفة)
-ALERT_OB_TOUCH = True            # السعر وصل إلى أوردربلوك
+ALERT_OB_TOUCH = True            # السعر عند أوردربلوك
+ALERT_CONTROL_TOUCH = True       # السعر لمس خط الكنترول
 ALERT_CONTROL_CROSS = True       # إغلاق شمعة عبر خط الكنترول
 ALERT_FVG_FORMED = False         # تكوّن فجوة جديدة (كثيرة جداً مع عدد الأسهم)
-MAX_OB_ALERTS = 3                # أقصى تنبيهات أوردربلوك للسهم يومياً
-MAX_CROSS_ALERTS = 4             # أقصى تنبيهات كنترول للسهم يومياً
+MAX_OB_ALERTS = 6                # أقصى تنبيهات أوردربلوك للسهم يومياً
+MAX_CTRL_TOUCH = 6               # أقصى تنبيهات لمس الكنترول للسهم يومياً
+MAX_CROSS_ALERTS = 4             # أقصى تنبيهات إغلاق عبر الكنترول للسهم يومياً
+OB_REALERT_MIN = 90              # إعادة التنبيه على نفس المنطقة بعد كم دقيقة
+CTRL_COOLDOWN_MIN = 30           # أقل فاصل بين تنبيهي لمس كنترول لنفس السهم
+TOUCH_TOL = 0.10                 # هامش اللمس (نسبة من ATR)
 
 
 def _now():
@@ -55,6 +63,7 @@ class Candle:
 
 # ───────────────────────── جلب البيانات (طلب واحد لكل الأسهم) ─────────────────────────
 _CACHE = {}
+_CUR_LAST = {"t": None}   # وقت فتح آخر شمعة وصلت في بيانات السهم الحالي (لحساب عمر البيانات)
 
 
 def _to_candles(df):
@@ -205,13 +214,27 @@ def _f(x):
     return f"{x:,.2f}"
 
 
+def fmt_delay(sec):
+    sec = max(sec, 0)
+    return f"{sec:.0f} ث" if sec < 90 else f"{sec / 60:.1f} د"
+
+
 def _stamp(t, label="شمعة"):
+    """يوضح على أي شمعة بُنيت الرسالة ومتى أُرسلت وعمر البيانات (نفس ختم بوت SPX)."""
     end = t + timedelta(minutes=5)
     sent = _now()
-    state = "مغلقة" if end <= sent else "جارية"
+    is_closed = end <= sent
+    line2 = f"🕒 أُرسلت {sent:%H:%M:%S}"
+    if is_closed:
+        line2 += f" (بعد إغلاقها بـ {fmt_delay((sent - end).total_seconds())})"
+    lt = _CUR_LAST["t"]
+    if lt is not None:
+        age = max((sent - lt).total_seconds() / 60.0, 0.0)
+        line2 += f" | عمر البيانات: {age:.1f} د " + ("✅" if age <= 6 else "⚠️ متأخرة")
     return (f"🕯 {label}: {t:%H:%M} → {end:%H:%M} نيويورك "
-            f"({LOCAL_NAME} {t.astimezone(LOCAL):%H:%M}) — {state}\n"
-            f"🕒 أُرسلت {sent:%H:%M:%S}")
+            f"({LOCAL_NAME} {t.astimezone(LOCAL):%H:%M}) — "
+            f"{'مغلقة' if is_closed else 'جارية'}\n"
+            f"{line2}")
 
 
 # ───────────────────────── لقطة السهم ─────────────────────────
@@ -223,12 +246,14 @@ def _snap(sym):
     closed = [c for c in sess if c.t + timedelta(minutes=5) <= now]
     if len(today) < 3 or len(closed) < 20:
         return None
+    _CUR_LAST["t"] = sess[-1].t
     ctrl, vwap = control_series(today)
     a = atr(closed[-60:]) or 0.01
     ns = SimpleNamespace(
         now=now, sess=sess, today=today, closed=closed,
         closed_today=[c for c in closed if c.t.date() == now.date()],
         price=sess[-1].c, last_t=sess[-1].t, atr5=a,
+        data_age=max((now - sess[-1].t).total_seconds() / 60.0, 0.0),
         control=ctrl[-1], vwap=vwap, ctrl_series=ctrl,
         day_high=max(c.h for c in today), day_low=min(c.l for c in today))
     zc = closed[-300:]
@@ -244,22 +269,26 @@ def _state(s, sym, now):
     if not st or st.get("day") != day:
         st = {"day": day, "count": 0, "signaled": [], "last": {}, "trades": []}
         root[sym] = st
-    for key in ("touched", "fvg_seen", "cross_seen"):   # حالات محفوظة من نسخة سابقة
+    for key in ("fvg_seen", "cross_seen", "ctrl_touch"):   # حالات محفوظة من نسخة سابقة
         st.setdefault(key, [])
+    st.setdefault("ob_touch", {})
+    st.setdefault("ob_count", 0)
     return st
 
 
 # ───────────────────────── تنبيهات الأوردربلوك والكنترول والفجوات ─────────────────────────
 def _alerts(sym, ns, st, cid, send):
     t = ns.now.time()
-    if t < SIGNAL_START or t > NO_NEW_AFTER or not ns.closed_today:
+    if t < ALERT_START or t > ALERT_END or not ns.closed_today:
         return
+    if ns.data_age > MAX_AGE_MIN:         # بيانات قديمة: لا ننبّه
+        return
+    cur = ns.today[-1]                    # آخر شمعة (قد تكون جارية)
     k = ns.closed_today[-1]
-    age = (ns.now - (k.t + timedelta(minutes=5))).total_seconds() / 60.0
-    if age > MAX_AGE_MIN:
-        return
+    tol = TOUCH_TOL * ns.atr5
+    now_ts = ns.now.timestamp()
 
-    # 1) فجوة جديدة
+    # 1) فجوة جديدة (متوقفة افتراضياً)
     if ALERT_FVG_FORMED and len(ns.closed) >= 2:
         for z in ns.zones:
             if (z.kind.startswith("FVG") and z.t >= ns.closed[-2].t
@@ -270,22 +299,50 @@ def _alerts(sym, ns, st, cid, send):
                           f"الفريم: 5 دقائق | السعر الآن: {_f(ns.price)}\n"
                           + _stamp(z.t, "شمعة تكوّن الفجوة"))
 
-    # 2) وصول السعر إلى أوردربلوك
-    if ALERT_OB_TOUCH and len(st["touched"]) < MAX_OB_ALERTS:
-        for z in ns.zones:
-            if not z.kind.startswith("OB") or z.id in st["touched"]:
+    # 2) السعر عند منطقة أوردربلوك (لمس الشمعة الحالية للمنطقة)
+    if ALERT_OB_TOUCH and st["ob_count"] < MAX_OB_ALERTS:
+        for z in sorted(ns.zones, key=lambda z: abs(ns.price - (z.lo + z.hi) / 2)):
+            if not z.kind.startswith("OB") or z.t >= k.t:
                 continue
-            near = (z.lo - 0.15 * ns.atr5 <= ns.price <= z.hi + 0.15 * ns.atr5)
-            if near and z.t < k.t:
-                st["touched"].append(z.id)
-                side = "شراء 🟢" if z.bullish else "بيع 🔴"
-                send(cid, f"🧱 {sym}: السعر عند منطقة {z.name} ({side})\n"
-                          f"النطاق: {_f(z.lo)} – {_f(z.hi)}\n"
-                          f"السعر الآن: {_f(ns.price)}\n"
-                          + _stamp(ns.last_t, "آخر شمعة في البيانات"))
-                break
+            touch = cur.l <= z.hi + tol and cur.h >= z.lo - tol
+            if not touch:
+                continue
+            prev_ts = st["ob_touch"].get(z.id)
+            if prev_ts and now_ts - prev_ts < OB_REALERT_MIN * 60:
+                continue
+            st["ob_touch"][z.id] = now_ts
+            st["ob_count"] += 1
+            side = "شراء 🟢" if z.bullish else "بيع 🔴"
+            inside = z.lo <= ns.price <= z.hi
+            where = "داخل المنطقة" if inside else "لمس المنطقة"
+            above = ns.price > ns.control
+            send(cid, f"🧱 {sym}: السعر عند منطقة {z.name} ({side})\n"
+                      f"النطاق: {_f(z.lo)} – {_f(z.hi)}\n"
+                      f"السعر الآن: {_f(ns.price)} ({where})\n"
+                      f"السعر {'فوق' if above else 'تحت'} خط الكنترول ({_f(ns.control)})\n"
+                      + _stamp(ns.last_t, "آخر شمعة في البيانات"))
+            break
 
-    # 3) إغلاق شمعة عبر خط الكنترول
+    # 3) السعر لمس خط الكنترول
+    if (ALERT_CONTROL_TOUCH and len(st["ctrl_touch"]) < MAX_CTRL_TOUCH
+            and len(ns.today) >= 2 and len(ns.ctrl_series) >= len(ns.today)):
+        cs_now, cs_prev = ns.ctrl_series[-1], ns.ctrl_series[-2]
+        prev = ns.today[-2]
+        touch_now = cur.l - tol <= cs_now <= cur.h + tol
+        touch_prev = prev.l - tol <= cs_prev <= prev.h + tol
+        last_ts = st["ctrl_touch"][-1] if st["ctrl_touch"] else 0
+        if (touch_now and not touch_prev
+                and now_ts - last_ts >= CTRL_COOLDOWN_MIN * 60):
+            st["ctrl_touch"].append(now_ts)
+            from_above = prev.c > cs_prev
+            how = ("جاء من الأعلى — اختبار دعم 🟢" if from_above
+                   else "جاء من الأسفل — اختبار مقاومة 🔴")
+            send(cid, f"🎯 {sym}: السعر لمس خط الكنترول\n"
+                      f"الكنترول: {_f(cs_now)} | السعر الآن: {_f(ns.price)}\n"
+                      f"{how}\n"
+                      + _stamp(ns.last_t, "آخر شمعة في البيانات"))
+
+    # 4) إغلاق شمعة عبر خط الكنترول
     tc = ns.closed_today
     if (ALERT_CONTROL_CROSS and len(st["cross_seen"]) < MAX_CROSS_ALERTS
             and len(tc) >= 2 and len(ns.ctrl_series) >= len(tc)):
@@ -341,6 +398,7 @@ def _open(sym, side, z, k, ns, st, bias):
         f"{'✅' if ctrl_ok else '⚠️'}\n"
         f"{htf_txt}\n\n"
         f"{_stamp(k.t, 'شمعة التأكيد')}\n"
+        f"🧱 {z.name} على شمعة: {z.t:%H:%M} نيويورك\n"
         f"💱 السعر الآن: {_f(ns.price)} ({ns.price - entry:+.2f} عن الدخول)\n\n"
         "⚠️ إشارة آلية للمساعدة وليست نصيحة مالية؛ التزم بإدارة المخاطر."
     )
