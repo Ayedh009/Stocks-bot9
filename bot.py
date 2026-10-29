@@ -1,4 +1,4 @@
-import os, json, time, requests
+import os, re, json, time, requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from scanner import (load, analyze, last_mss, report, near_info, lifecycle,
@@ -25,6 +25,13 @@ DEFAULT_SYMBOLS = [
 ]
 TF_NAME = {"1H": "الساعة", "4H": "4 ساعات"}
 
+# كل المحادثات اللي تصلها التنبيهات (رقمك + القروب) من السر CHAT_ID مفصولة بفاصلة
+ALL = "ALL"
+ALERT_IDS = []
+for _x in os.getenv("CHAT_ID", "").replace(" ", "").split(","):
+    if _x.lstrip("-").isdigit():
+        ALERT_IDS.append(int(_x))
+
 
 def load_state():
     s = json.load(open(STATE)) if os.path.exists(STATE) else {}
@@ -38,6 +45,10 @@ def load_state():
         s["symbols"] = list(DEFAULT_SYMBOLS)
         s["ver"] = VERSION
     s.setdefault("symbols", list(DEFAULT_SYMBOLS))
+    if ALERT_IDS:
+        s["chat_id"] = ALERT_IDS[0]
+    elif s["chat_id"]:
+        ALERT_IDS.append(s["chat_id"])
     return s
 
 
@@ -46,9 +57,14 @@ def save_state(s):
 
 
 def send(chat_id, text):
-    requests.post(f"{API}/sendMessage",
-                  data={"chat_id": chat_id, "text": text}, timeout=20)
-    time.sleep(0.5)
+    ids = ALERT_IDS if chat_id == ALL else [chat_id]
+    for cid in ids:
+        try:
+            requests.post(f"{API}/sendMessage",
+                          data={"chat_id": cid, "text": text}, timeout=20)
+        except Exception as e:
+            print("send خطأ", cid, e)
+        time.sleep(0.3)
 
 
 def ny_now():
@@ -59,6 +75,39 @@ def ny_now():
 def scan_window_open():
     now, mins = ny_now()
     return now.weekday() < 5 and SCAN_START <= mins <= SCAN_END
+
+
+def quick_report(sym):
+    """تحليل قصير وسريع لسهم واحد."""
+    d1, d4 = load(sym)
+    r1, r4 = analyze(d1), analyze(d4)
+    price = float(d1["Close"].iloc[-1])
+    ts = d1.index[-1].strftime("%H:%M")
+    m1, m4 = last_mss(r1), last_mss(r4)
+    lines = [f"📌 {sym} | {price:.2f} (آخر شمعة {ts} نيويورك)"]
+    if m1:
+        lc = lifecycle(r1, r4, m1)
+        arrow = "🟢 صاعد" if m1["dir"] == "bull" else "🔴 هابط"
+        conf = " ✅ مؤكد من 4س" if lc["confirmed"] else ""
+        lines.append(f"1س: {arrow} | كسر {m1['level']:.2f}{conf}")
+        lines.append(f"المرحلة: {STAGE_TXT[lc['stage']]}")
+        if lc["stage"] not in TERMINAL:
+            lines.append(f"الوقف: {lc['stop1']:.2f} / {lc['stop2']:.2f}")
+            if lc["targets"]:
+                lines.append("الأهداف: " + ", ".join(f"{t:.2f}" for t in lc["targets"]))
+    else:
+        lines.append("1س: لا يوجد كسر هيكل حالياً")
+    if m4:
+        a4 = "🟢 صاعد" if m4["dir"] == "bull" else "🔴 هابط"
+        lines.append(f"4س: {a4} | كسر {m4['level']:.2f}")
+    near = near_info(r1, r4, price)
+    for tf in ("1H", "4H"):
+        v = near[tf]
+        if v:
+            kind = "هابط" if v["dir"] == "bear" else "صاعد"
+            lines.append(f"⚠️ قريب من كسر {kind} ({TF_NAME[tf]}) عند "
+                         f"{v['level']:.2f} (المسافة {v['dist']:.2f}$)")
+    return "\n".join(lines)
 
 
 def status_board(s, title):
@@ -103,7 +152,7 @@ def due_summaries(s):
             if s["chat_id"]:
                 title = ("🌅 ملخص ما قبل الافتتاح" if name == "am"
                          else "🌇 ملخص نهاية اليوم")
-                send(s["chat_id"], status_board(s, title))
+                send(ALL, status_board(s, title))
             s["summaries"][key] = True
     s["summaries"] = {k: v for k, v in s["summaries"].items()
                       if k.startswith(day)}
@@ -122,21 +171,25 @@ def poll_commands(s):
         if not txt or not cid:
             continue
         parts = txt.split()
-        cmd, args = parts[0].lower(), [p.upper() for p in parts[1:]]
+        cmd = parts[0].lower().split("@")[0]      # يدعم /status@اسم_البوت في القروب
+        args = [p.upper() for p in parts[1:]]
 
-        if cmd in TEST_WORDS and s["chat_id"] is None:
+        if not ALERT_IDS and (cmd in TEST_WORDS or cmd == "/start"):
+            ALERT_IDS.append(cid)
             s["chat_id"] = cid
 
         if cmd == "/start":
-            s["chat_id"] = cid
-            send(cid, "تم التفعيل ✅\n"
-                      "اكتب اسم سهم (مثل TSLA) ويرسل لك تقريره\n"
-                      "اكتب status أو ستاتوس للوحة كل الأسهم\n"
-                      "/add TSLA NVDA  إضافة\n"
-                      "/remove TSLA  حذف\n/list  عرض القائمة\n"
-                      "/spx TSLA  لقطة السباكس للسهم\n"
-                      "test  اختبار البوت")
-        elif cid != s["chat_id"]:
+            if cid in ALERT_IDS:
+                send(cid, "تم التفعيل ✅\n"
+                          "اكتب اسم سهم (مثل TSLA) ويرسل لك تحليل قصير\n"
+                          "لأي شركة خارج القائمة اكتب $ABNB\n"
+                          "اكتب status أو ستاتوس للوحة كل الأسهم\n"
+                          "/now TSLA  التقرير الكامل\n"
+                          "/add TSLA NVDA  إضافة\n"
+                          "/remove TSLA  حذف\n/list  عرض القائمة\n"
+                          "/spx TSLA  لقطة السباكس للسهم\n"
+                          "test  اختبار البوت")
+        elif cid not in ALERT_IDS:
             continue
         elif cmd in TEST_WORDS:
             status = ("مفتوح 🟢" if scan_window_open()
@@ -145,6 +198,7 @@ def poll_commands(s):
                       f"الفحص الآن: {status}\n"
                       f"عدد الشركات: {len(s['symbols'])}\n"
                       f"{', '.join(s['symbols'])}\n"
+                      f"عدد المحادثات المرتبطة: {len(ALERT_IDS)}\n"
                       f"تنبيه الاقتراب: ضمن {NEAR_USD:g}$ من كسر هيكل MSS (الساعة و4س)\n"
                       "الفحص كل 5 دقائق، وملخص يومي 8:00 ص و4:15 م نيويورك.")
         elif cmd in STATUS_WORDS:
@@ -171,15 +225,21 @@ def poll_commands(s):
                     send(cid, report(a))
                 except Exception as e:
                     send(cid, f"{a}: خطأ {e}")
-        else:
-            # رسالة فيها أسماء أسهم فقط (TSLA أو NVDA AMD أو $TSLA)
-            names = [t.lstrip("$").upper() for t in parts]
-            if all(n in s["symbols"] for n in names):
-                for n in names:
+        elif len(parts) <= 4:
+            # اسم سهم من القائمة (TSLA)، أو أي شركة بعلامة $ (مثل $ABNB)
+            todo = []
+            for raw in (t.upper() for t in parts):
+                n = raw.lstrip("$")
+                if n in s["symbols"] or (raw.startswith("$")
+                                         and re.fullmatch(r"[A-Z.\-]{1,6}", n)):
+                    todo.append(n)
+            if len(todo) == len(parts):
+                for n in todo:
                     try:
-                        send(cid, report(n))
+                        send(cid, quick_report(n))
                     except Exception as e:
-                        send(cid, f"{n}: خطأ {e}")
+                        print(n, "خطأ", e)
+                        send(cid, f"{n}: تعذر التحليل (تأكد من الرمز)")
     save_state(s)
 
 
@@ -245,8 +305,13 @@ def send_signal(cid, sym, d1, m1, lc, text):
                  if sweep else "\n  سحب سيولة: ❌ لا يوجد")
         extra += f"\n  الفوليوم: {'✅' if vol_ok else '❌'} ({ratio}× المتوسط)"
         png = make_chart(d1, sym, "1H", sig, sweep)
-        send_photo(TOKEN, cid, png, text + extra)
-        time.sleep(0.5)
+        ids = ALERT_IDS if cid == ALL else [cid]
+        for c in ids:
+            try:
+                send_photo(TOKEN, c, png, text + extra)
+            except Exception as e:
+                print(sym, "send_photo خطأ", c, e)
+            time.sleep(0.3)
     except Exception as e:
         print(sym, "chart خطأ", e)
         send(cid, text)
@@ -257,7 +322,7 @@ def process(sym, s):
     r1, r4 = analyze(d1), analyze(d4)
     price = float(d1["Close"].iloc[-1])
     ts = d1.index[-1].strftime("%H:%M")
-    cid = s["chat_id"]
+    cid = ALL
 
     # 1) دورة الصفقة (المحرك: كسر الساعة)
     m1 = last_mss(r1)
@@ -304,7 +369,7 @@ def process(sym, s):
         send(cid, near_text(sym, price, near, ts))
 
     # 4) إشارات السباكس (أوردربلوك + كنترول) على هذا السهم
-    spx_process(sym, s, d1, send)
+    spx_process(sym, s, d1, lambda c, t: send(ALL, t))
 
 
 def scan(s):
